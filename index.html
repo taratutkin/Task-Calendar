@@ -323,13 +323,127 @@
   </div>
 </div>
 
+<!-- Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
+
 <script>
+// ==================== FIREBASE SYNC ====================
+// 1) Вставь сюда firebaseConfig из Firebase Console → Project settings → Your apps → Web app.
+// 2) В Firestore будет использоваться один общий документ: boards/family-calendar.
+const firebaseConfig = {
+  apiKey: "PASTE_YOUR_API_KEY_HERE",
+  authDomain: "PASTE_YOUR_AUTH_DOMAIN_HERE",
+  projectId: "PASTE_YOUR_PROJECT_ID_HERE",
+  storageBucket: "PASTE_YOUR_STORAGE_BUCKET_HERE",
+  messagingSenderId: "PASTE_YOUR_MESSAGING_SENDER_ID_HERE",
+  appId: "PASTE_YOUR_APP_ID_HERE"
+};
+
+const FIREBASE_ENABLED = !firebaseConfig.apiKey.includes("PASTE_YOUR");
+let db = null;
+let boardRef = null;
+let isApplyingCloudData = false;
+let cloudSaveTimer = null;
+
+if (FIREBASE_ENABLED) {
+  try {
+    firebase.initializeApp(firebaseConfig);
+    db = firebase.firestore();
+    boardRef = db.collection("boards").doc("family-calendar");
+  } catch (error) {
+    console.error("Firebase init error:", error);
+  }
+}
+
+const APP_STORAGE_KEYS = new Set([
+  'cal_events2',
+  'cal_todos2',
+  'cal_habits2',
+  'cal_habitlog2',
+  'cal_facelog2',
+  'cal_facesym2'
+]);
+
 const DAYS_RU=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
 const MONTHS_RU=['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
 const MONTHS_GEN=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
 
 function load(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d;}catch{return d;}}
-function save(k,v){localStorage.setItem(k,JSON.stringify(v));}
+function save(k,v){
+  localStorage.setItem(k,JSON.stringify(v));
+  if(APP_STORAGE_KEYS.has(k)) scheduleCloudSave();
+}
+
+function getBoardDataFromState(){
+  return {
+    events:S.events||{},
+    todos:S.todos||[],
+    habits:S.habits||[],
+    habitLog:S.habitLog||{},
+    faceLog:S.faceLog||{},
+    faceCalSymbol:S.faceCalSymbol||{morning:'☀',evening:'🌙'},
+    updatedAt: Date.now()
+  };
+}
+
+function applyBoardData(data){
+  if(!data) return;
+  isApplyingCloudData = true;
+  S.events = data.events || {};
+  S.todos = data.todos || [];
+  S.habits = data.habits || [];
+  S.habitLog = data.habitLog || {};
+  S.faceLog = data.faceLog || {};
+  S.faceCalSymbol = data.faceCalSymbol || {morning:'☀',evening:'🌙'};
+
+  localStorage.setItem('cal_events2', JSON.stringify(S.events));
+  localStorage.setItem('cal_todos2', JSON.stringify(S.todos));
+  localStorage.setItem('cal_habits2', JSON.stringify(S.habits));
+  localStorage.setItem('cal_habitlog2', JSON.stringify(S.habitLog));
+  localStorage.setItem('cal_facelog2', JSON.stringify(S.faceLog));
+  localStorage.setItem('cal_facesym2', JSON.stringify(S.faceCalSymbol));
+
+  renderCalendar();
+  renderTodos();
+  renderHabitsBlock();
+  renderFaceBlock();
+  updateFinance();
+  isApplyingCloudData = false;
+}
+
+function scheduleCloudSave(){
+  if(!FIREBASE_ENABLED || !boardRef || isApplyingCloudData || typeof S === 'undefined') return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(saveBoardToCloud, 350);
+}
+
+async function saveBoardToCloud(){
+  if(!FIREBASE_ENABLED || !boardRef || typeof S === 'undefined') return;
+  try {
+    await boardRef.set(getBoardDataFromState(), { merge: true });
+    console.log('Данные сохранены в Firestore');
+  } catch (error) {
+    console.error('Ошибка записи в Firestore:', error);
+  }
+}
+
+function startCloudSync(){
+  if(!FIREBASE_ENABLED || !boardRef) {
+    console.warn('Firebase не настроен: вставь firebaseConfig в index.html');
+    return;
+  }
+  boardRef.onSnapshot(async (doc) => {
+    if(doc.exists) {
+      applyBoardData(doc.data());
+    } else {
+      // Если общего документа ещё нет, первым открытием заливаем текущие локальные данные в облако.
+      await saveBoardToCloud();
+    }
+  }, (error) => {
+    console.error('Ошибка чтения из Firestore:', error);
+  });
+}
 
 const now=()=>new Date();
 function dateKey(y,m,d){return `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;}
@@ -981,6 +1095,7 @@ renderTodos();
 renderHabitsBlock();
 renderFaceBlock();
 updateFinance();
+startCloudSync();
 
 if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();
 
