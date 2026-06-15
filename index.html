@@ -1090,6 +1090,37 @@ document.getElementById('btn-notif-check').addEventListener('click',()=>{
   if(!found)queueNotif('Уведомления','На сегодня и завтра событий нет');
 });
 
+function showSystemNotification(title, body){
+  if (!('Notification' in window)) return;
+
+  if (Notification.permission === 'granted') {
+    new Notification(title, {
+      body: body,
+      tag: title + body,
+      requireInteraction: false
+    });
+  } else if (Notification.permission === 'default') {
+    Notification.requestPermission().then(permission => {
+      if (permission === 'granted') {
+        new Notification(title, {
+          body: body,
+          tag: title + body,
+          requireInteraction: false
+        });
+      }
+    });
+  }
+}
+function checkTodoSystemNotifications(){
+  const activeTodos = S.todos.filter(td => !td.done);
+
+  activeTodos.forEach(td => {
+    showSystemNotification(
+      'Задача',
+      `${td.text} — выполнена ли задача?`
+    );
+  });
+}
 // ==================== TODO REMINDERS ====================
 let todoNotifQueue2=[];let todoNotifIdx2=0;
 function checkTodoReminders(){
@@ -1127,8 +1158,14 @@ startCloudSync();
 
 if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();
 
-setTimeout(()=>{checkTodoReminders();checkScheduledNotifs();},1200);
-setInterval(checkScheduledNotifs,5*60*1000);
+setTimeout(()=>{
+  checkTodoReminders();
+  checkScheduledNotifs();
+  checkTodoSystemNotifications();
+}, 1200);
+
+setInterval(checkScheduledNotifs, 5 * 60 * 1000);
+setInterval(checkTodoSystemNotifications, 15 * 60 * 1000);
 </script>
 </body>
 </html>
