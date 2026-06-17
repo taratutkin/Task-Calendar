@@ -329,8 +329,8 @@
 
 <script>
 // ==================== FIREBASE SYNC ====================
-// 1) Вставь сюда firebaseConfig из Firebase Console → Project settings → Your apps → Web app.
-// 2) В Firestore будет использоваться один общий документ: boards/family-calendar.
+// Общая база: Firestore → boards/family-calendar.
+// ВАЖНО: пустой браузер больше НЕ может затереть общую базу пустотой.
 const firebaseConfig = {
   apiKey: "AIzaSyBR2sfiBcROF-swwnmBqIGLt_ySnr1nMns",
   authDomain: "task-calendar-c8e43.firebaseapp.com",
@@ -347,6 +347,10 @@ let db = null;
 let boardRef = null;
 let isApplyingCloudData = false;
 let cloudSaveTimer = null;
+let cloudReady = false;
+let lastCloudDataHadContent = false;
+let pendingLocalSaveBeforeCloudReady = false;
+let pendingLocalDataBeforeCloudReady = null;
 
 if (FIREBASE_ENABLED) {
   try {
@@ -377,6 +381,21 @@ function save(k,v){
   if(APP_STORAGE_KEYS.has(k)) scheduleCloudSave();
 }
 
+function isPlainObjectWithKeys(obj){
+  return !!obj && typeof obj === 'object' && !Array.isArray(obj) && Object.keys(obj).length > 0;
+}
+
+function isBoardDataEmpty(data){
+  if(!data) return true;
+  return !(
+    isPlainObjectWithKeys(data.events) ||
+    (Array.isArray(data.todos) && data.todos.length > 0) ||
+    (Array.isArray(data.habits) && data.habits.length > 0) ||
+    isPlainObjectWithKeys(data.habitLog) ||
+    isPlainObjectWithKeys(data.faceLog)
+  );
+}
+
 function getBoardDataFromState(){
   return {
     events:S.events||{},
@@ -389,9 +408,22 @@ function getBoardDataFromState(){
   };
 }
 
+function saveLastNonEmptyBackup(data){
+  if(isBoardDataEmpty(data)) return;
+  try {
+    localStorage.setItem('cal_last_nonempty_backup', JSON.stringify({
+      savedAt: Date.now(),
+      data
+    }));
+  } catch (error) {
+    console.warn('Не удалось сохранить локальный бэкап:', error);
+  }
+}
+
 function applyBoardData(data){
   if(!data) return;
   isApplyingCloudData = true;
+
   S.events = data.events || {};
   S.todos = data.todos || [];
   S.habits = data.habits || [];
@@ -406,24 +438,55 @@ function applyBoardData(data){
   localStorage.setItem('cal_facelog2', JSON.stringify(S.faceLog));
   localStorage.setItem('cal_facesym2', JSON.stringify(S.faceCalSymbol));
 
+  saveLastNonEmptyBackup(data);
+
   renderCalendar();
   renderTodos();
   renderHabitsBlock();
   renderFaceBlock();
   updateFinance();
+
   isApplyingCloudData = false;
 }
 
 function scheduleCloudSave(){
   if(!FIREBASE_ENABLED || !boardRef || isApplyingCloudData || typeof S === 'undefined') return;
+
+  // Пока Firestore не ответил первым снимком, ничего в облако не пишем.
+  // Это защищает от ситуации: новый пустой браузер открыл сайт и успел затереть базу.
+  if(!cloudReady) {
+    pendingLocalSaveBeforeCloudReady = true;
+    pendingLocalDataBeforeCloudReady = getBoardDataFromState();
+    console.warn('Сохранение в Firestore отложено: база ещё не загружена.');
+    return;
+  }
+
   clearTimeout(cloudSaveTimer);
   cloudSaveTimer = setTimeout(saveBoardToCloud, 350);
 }
 
-async function saveBoardToCloud(){
+async function saveBoardToCloud(options = {}){
   if(!FIREBASE_ENABLED || !boardRef || typeof S === 'undefined') return;
+
+  const data = getBoardDataFromState();
+  const empty = isBoardDataEmpty(data);
+
+  // Главная защита: пустое состояние никогда не записываем в общий документ.
+  // Если нужно реально всё удалить — лучше делать отдельную кнопку/режим, а не автосохранением.
+  if(empty && !options.allowEmpty) {
+    console.warn('Пустые данные НЕ записаны в Firestore. Защита от затирания базы.');
+    return;
+  }
+
+  // Дополнительная защита: если в облаке уже были данные, пустотой их не затираем вообще.
+  if(empty && lastCloudDataHadContent) {
+    console.warn('Firestore НЕ перезаписан пустотой: в облаке уже были данные.');
+    return;
+  }
+
   try {
-    await boardRef.set(getBoardDataFromState(), { merge: true });
+    saveLastNonEmptyBackup(data);
+    await boardRef.set(data, { merge: true });
     console.log('Данные сохранены в Firestore');
   } catch (error) {
     console.error('Ошибка записи в Firestore:', error);
@@ -435,12 +498,45 @@ function startCloudSync(){
     console.warn('Firebase не настроен: вставь firebaseConfig в index.html');
     return;
   }
+
   boardRef.onSnapshot(async (doc) => {
+    cloudReady = true;
+
     if(doc.exists) {
-      applyBoardData(doc.data());
+      const data = doc.data();
+      const cloudIsEmpty = isBoardDataEmpty(data);
+      lastCloudDataHadContent = !cloudIsEmpty;
+
+      // Если база пустая, а пользователь успел что-то ввести до первой загрузки Firebase,
+      // сохраняем именно введённые данные, а не пустоту из облака.
+      if(cloudIsEmpty && pendingLocalSaveBeforeCloudReady && !isBoardDataEmpty(pendingLocalDataBeforeCloudReady)) {
+        applyBoardData(pendingLocalDataBeforeCloudReady);
+        pendingLocalSaveBeforeCloudReady = false;
+        pendingLocalDataBeforeCloudReady = null;
+        await saveBoardToCloud();
+        return;
+      }
+
+      pendingLocalSaveBeforeCloudReady = false;
+      pendingLocalDataBeforeCloudReady = null;
+      applyBoardData(data);
     } else {
-      // Если общего документа ещё нет, первым открытием заливаем текущие локальные данные в облако.
-      await saveBoardToCloud();
+      // Если документа нет, создаём его ТОЛЬКО если в текущем браузере есть реальные локальные данные.
+      // Пустой новый браузер не создаёт пустую базу и ничего не затирает.
+      const localData = (!isBoardDataEmpty(pendingLocalDataBeforeCloudReady))
+        ? pendingLocalDataBeforeCloudReady
+        : getBoardDataFromState();
+
+      pendingLocalSaveBeforeCloudReady = false;
+      pendingLocalDataBeforeCloudReady = null;
+
+      if(!isBoardDataEmpty(localData)) {
+        applyBoardData(localData);
+        lastCloudDataHadContent = true;
+        await saveBoardToCloud();
+      } else {
+        console.warn('Документа Firestore ещё нет, локальные данные пустые — ничего не записываем.');
+      }
     }
   }, (error) => {
     console.error('Ошибка чтения из Firestore:', error);
@@ -1090,27 +1186,6 @@ document.getElementById('btn-notif-check').addEventListener('click',()=>{
   if(!found)queueNotif('Уведомления','На сегодня и завтра событий нет');
 });
 
-function showSystemNotification(title, body){
-  if (!('Notification' in window)) return;
-
-  if (Notification.permission === 'granted') {
-    new Notification(title, {
-      body: body,
-      tag: title + body,
-      requireInteraction: false
-    });
-  } else if (Notification.permission === 'default') {
-    Notification.requestPermission().then(permission => {
-      if (permission === 'granted') {
-        new Notification(title, {
-          body: body,
-          tag: title + body,
-          requireInteraction: false
-        });
-      }
-    });
-  }
-}
 function checkTodoSystemNotifications(){
   const activeTodos = S.todos.filter(td => !td.done);
 
