@@ -87,7 +87,9 @@
   .todo-text{flex:1;font-size:12px;line-height:1.4;}
   .todo-text.done{text-decoration:line-through;color:var(--text-muted);}
   .todo-meta{font-size:10px;color:var(--text-muted);margin-top:1px;}
+  .todo-edit{opacity:0;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:13px;padding:0 2px;transition:opacity 0.15s;line-height:1;}
   .todo-del{opacity:0;background:none;border:none;color:var(--red);cursor:pointer;font-size:13px;padding:0 2px;transition:opacity 0.15s;line-height:1;}
+  .todo-item:hover .todo-edit{opacity:1;}
   .empty-hint{font-size:12px;color:var(--text-dim);padding:4px 0;}
 
   /* Habits */
@@ -430,6 +432,7 @@ function applyBoardData(data){
   S.habitLog = data.habitLog || {};
   S.faceLog = data.faceLog || {};
   S.faceCalSymbol = data.faceCalSymbol || {morning:'☀',evening:'🌙'};
+  ensureEventIds();
 
   localStorage.setItem('cal_events2', JSON.stringify(S.events));
   localStorage.setItem('cal_todos2', JSON.stringify(S.todos));
@@ -486,7 +489,7 @@ async function saveBoardToCloud(options = {}){
 
   try {
     saveLastNonEmptyBackup(data);
-    await boardRef.set(data, { merge: true });
+    await boardRef.set(data);
     console.log('Данные сохранены в Firestore');
   } catch (error) {
     console.error('Ошибка записи в Firestore:', error);
@@ -553,6 +556,54 @@ function formatDateTime(ts){const d=new Date(ts);return `${d.getDate()} ${MONTHS
 function elapsed(ts){const ms=Date.now()-ts;const mins=Math.floor(ms/60000);const hours=Math.floor(mins/60);const days=Math.floor(hours/24);if(days>0)return `${days} дн. ${hours%24} ч. ${mins%60} мин.`;if(hours>0)return `${hours} ч. ${mins%60} мин.`;return `${mins} мин.`;}
 function fmtAmount(a){const n=parseFloat(a)||0;const r=Math.round(n*100)/100;return r===Math.floor(r)?String(Math.floor(r)):r.toFixed(2);}
 function fmtCurrency(amount,currency){const a=fmtAmount(amount);return currency==='$'?('$ '+a):(a+' '+currency);}
+
+function newEventId(){return 'e'+Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+function ensureEventIds(){
+  Object.values(S.events||{}).forEach(evs=>{
+    (evs||[]).forEach(ev=>{ if(!ev.id) ev.id=newEventId(); });
+  });
+}
+function compareDateKeys(a,b){return a===b?0:(a<b?-1:1);}
+function addMonthsSameDay(key, months){
+  const {y,m,d}=parseKey(key);
+  const targetFirst=new Date(y,m+months,1);
+  const ty=targetFirst.getFullYear();
+  const tm=targetFirst.getMonth();
+  const lastDay=new Date(ty,tm+1,0).getDate();
+  return dateKey(ty,tm,Math.min(d,lastDay));
+}
+function removeFutureRecurringCopies(seriesId, fromKey, includeFromKey=false){
+  if(!seriesId) return;
+  Object.keys(S.events||{}).forEach(key=>{
+    const cmp=compareDateKeys(key,fromKey);
+    if(cmp>0 || (includeFromKey&&cmp===0)){
+      S.events[key]=(S.events[key]||[]).filter(ev=>ev.generatedFrom!==seriesId);
+      if(!S.events[key].length) delete S.events[key];
+    }
+  });
+}
+function syncRecurringChargeSeries(masterKey, masterId, horizonMonths=24){
+  ensureEventIds();
+  const evs=S.events[masterKey]||[];
+  const master=evs.find(ev=>ev.id===masterId);
+  if(!master || master.type!=='charge' || !master.recurring) return;
+  master.generated=false;
+  master.generatedFrom='';
+  removeFutureRecurringCopies(masterId,masterKey,false);
+  for(let i=1;i<=horizonMonths;i++){
+    const key=addMonthsSameDay(masterKey,i);
+    if(!S.events[key]) S.events[key]=[];
+    const copy={
+      ...master,
+      id:newEventId(),
+      generated:true,
+      generatedFrom:masterId,
+      recurring:true,
+      done:false
+    };
+    S.events[key].push(copy);
+  }
+}
 
 function getWeekStart(date){const d=new Date(date);const dow=d.getDay();const diff=(dow===0)?-6:1-dow;d.setDate(d.getDate()+diff);return d;}
 
@@ -723,22 +774,42 @@ document.getElementById('ev-no-time').addEventListener('change',function(){
 
 document.getElementById('modal-save').addEventListener('click',function(){
   const text=document.getElementById('ev-text').value.trim();if(!text)return;
+  ensureEventIds();
   if(this.dataset.editMode){
     // EDIT existing event
     const key=_editKey,idx=_editIdx;
     const ev=S.events[key][idx];
+    const oldRecurring=!!ev.recurring;
+    if(!ev.id) ev.id=newEventId();
+    const seriesId=ev.generatedFrom || ev.id;
+
     ev.text=text;
     if(ev.type==='charge'){
       ev.amount=parseFloat(document.getElementById('ev-amount').value)||0;
       ev.currency=document.getElementById('ev-currency').value;
       ev.recurring=document.getElementById('ev-recurring').checked;
+
+      if(ev.recurring){
+        // Если редактируем сгенерированную будущую копию, превращаем её в новую точку серии с этого месяца.
+        if(ev.generatedFrom){
+          removeFutureRecurringCopies(ev.generatedFrom,key,false);
+          ev.generated=false;
+          ev.generatedFrom='';
+          ev.id=newEventId();
+        }
+        syncRecurringChargeSeries(key,ev.id);
+      } else if(oldRecurring || ev.generatedFrom){
+        // При снятии галочки удаляем только будущие копии, текущий и прошлые месяцы не трогаем.
+        removeFutureRecurringCopies(seriesId,key,false);
+        ev.generated=false;
+        ev.generatedFrom='';
+      }
     }
     if(ev.type==='event'||ev.type==='important'){
       ev.noTime=document.getElementById('ev-no-time').checked;
       ev.time=ev.noTime?'':document.getElementById('ev-time').value;
     }
     delete this.dataset.editMode;
-    // restore save button title
     this.textContent='Сохранить';
     save('cal_events2',S.events);
     renderCalendar();renderModalExisting(key);updateFinance();
@@ -746,7 +817,7 @@ document.getElementById('modal-save').addEventListener('click',function(){
     // ADD new event
     const key=curModalKey;
     const type=S.curModalType;
-    const ev={type,text};
+    const ev={id:newEventId(),type,text};
     if(type==='charge'){
       ev.amount=parseFloat(document.getElementById('ev-amount').value)||0;
       ev.currency=document.getElementById('ev-currency').value;
@@ -758,6 +829,7 @@ document.getElementById('modal-save').addEventListener('click',function(){
     }
     if(!S.events[key])S.events[key]=[];
     S.events[key].push(ev);
+    if(type==='charge'&&ev.recurring) syncRecurringChargeSeries(key,ev.id);
     save('cal_events2',S.events);
     renderCalendar();renderModalExisting(key);updateFinance();
     document.getElementById('ev-text').value='';
@@ -792,8 +864,16 @@ function renderModalExisting(key){
 }
 
 window.deleteEvent=function(key,idx){
+  ensureEventIds();
+  const ev=(S.events[key]||[])[idx];
+  if(!ev) return;
+  const seriesId=ev.generatedFrom || ev.id;
   S.events[key].splice(idx,1);
   if(!S.events[key].length)delete S.events[key];
+  // Если удаляем ежемесячное списание, будущие автокопии тоже удаляем. Прошлые месяцы не трогаем.
+  if(ev.type==='charge' && (ev.recurring || ev.generatedFrom)){
+    removeFutureRecurringCopies(seriesId,key,false);
+  }
   save('cal_events2',S.events);
   renderCalendar();renderModalExisting(key);updateFinance();
 };
@@ -832,37 +912,16 @@ function updateFinance(){
   const todayD=t.getDate();
   const daysInMonth=new Date(y,m+1,0).getDate();
   let gel=0,usd=0,rub=0;
-  // 1) explicit charges in current month from today onwards
+  // Суммируем реальные списания, которые лежат в текущем месяце. Ежемесячные списания теперь создаются как отдельные копии на будущие месяцы.
   for(let d=todayD;d<=daysInMonth;d++){
     (S.events[dateKey(y,m,d)]||[]).forEach(ev=>{
       if(ev.type!=='charge')return;
-      if(ev.done)return; // marked as paid — skip
+      if(ev.done)return;
       if(ev.currency==='₾')gel+=parseFloat(ev.amount)||0;
       else if(ev.currency==='$')usd+=parseFloat(ev.amount)||0;
       else if(ev.currency==='₽')rub+=parseFloat(ev.amount)||0;
     });
   }
-  // 2) recurring from other months — project into remaining days of current month
-  const covered=new Set();
-  for(let d=todayD;d<=daysInMonth;d++){
-    (S.events[dateKey(y,m,d)]||[]).forEach(ev=>{
-      if(ev.type==='charge')covered.add(ev.text+'|'+ev.currency+'|'+d);
-    });
-  }
-  Object.entries(S.events).forEach(([key,evs])=>{
-    const{y:ky,m:km,d:kd}=parseKey(key);
-    if(ky===y&&km===m)return;
-    evs.forEach(ev=>{
-      if(!ev.recurring||ev.type!=='charge'||ev.done)return;
-      if(kd<todayD||kd>daysInMonth)return;
-      const uid=ev.text+'|'+ev.currency+'|'+kd;
-      if(covered.has(uid))return;
-      covered.add(uid);
-      if(ev.currency==='₾')gel+=parseFloat(ev.amount)||0;
-      else if(ev.currency==='$')usd+=parseFloat(ev.amount)||0;
-      else if(ev.currency==='₽')rub+=parseFloat(ev.amount)||0;
-    });
-  });
   const parts=[];
   if(gel>0)parts.push(fmtAmount(gel)+' ₾');
   if(usd>0)parts.push('$ '+fmtAmount(usd));
@@ -875,6 +934,7 @@ function renderTodos(){
   const list=document.getElementById('todo-list');list.innerHTML='';
   if(!S.todos.length){list.innerHTML='<div class="empty-hint">Пока нет дел...</div>';return;}
   S.todos.forEach((item,idx)=>{
+    if(!item.id) item.id='t'+Date.now()+Math.random().toString(36).slice(2,6);
     const row=document.createElement('div');row.className='todo-item';
     const check=document.createElement('div');check.className='todo-check'+(item.done?' done':'');
     check.addEventListener('click',()=>{S.todos[idx].done=!S.todos[idx].done;save('cal_todos2',S.todos);renderTodos();});
@@ -882,11 +942,24 @@ function renderTodos(){
     const tp=document.createElement('div');tp.className='todo-text'+(item.done?' done':'');tp.textContent=item.text;
     const mp=document.createElement('div');mp.className='todo-meta';mp.textContent='Добавлено '+formatDateTime(item.addedAt);
     textDiv.appendChild(tp);textDiv.appendChild(mp);
-    const del=document.createElement('button');del.className='todo-del';del.innerHTML='<i class="ti ti-x"></i>';
+    const edit=document.createElement('button');edit.className='todo-edit';edit.innerHTML='<i class="ti ti-pencil"></i>';edit.title='Редактировать';
+    edit.addEventListener('click',()=>editTodo(idx));
+    const del=document.createElement('button');del.className='todo-del';del.innerHTML='<i class="ti ti-x"></i>';del.title='Удалить';
     del.addEventListener('click',()=>{S.todos.splice(idx,1);save('cal_todos2',S.todos);renderTodos();});
-    row.appendChild(check);row.appendChild(textDiv);row.appendChild(del);
+    row.appendChild(check);row.appendChild(textDiv);row.appendChild(edit);row.appendChild(del);
     list.appendChild(row);
   });
+}
+
+function editTodo(idx){
+  const oldText=(S.todos[idx]&&S.todos[idx].text)||'';
+  const next=prompt('Изменить дело:',oldText);
+  if(next===null)return;
+  const val=next.trim();
+  if(!val)return;
+  S.todos[idx].text=val;
+  save('cal_todos2',S.todos);
+  renderTodos();
 }
 
 function togglePanel(panelId,toggleBtnId){
@@ -1042,6 +1115,8 @@ document.getElementById('habit-cfg-save').addEventListener('click',()=>{
 // Queue of pending popups
 let notifQueue=[];
 let notifShowing=false;
+const notificationStartupMuteUntil=Date.now()+6*60*1000;
+function shouldSuppressStartupNotif(){return Date.now()<notificationStartupMuteUntil;}
 
 function queueNotif(type,text,dateStr){
   // Внутреннее уведомление на странице — оставляем
@@ -1049,27 +1124,24 @@ function queueNotif(type,text,dateStr){
   if(!notifShowing)showNextNotif();
 
   // Уведомление Windows / браузера
-  showSystemNotification(type, text);
+  showSystemNotification(type, text, 'event-'+String(text).slice(0,80));
 }
 
-function showSystemNotification(title, body){
+function showSystemNotification(title, body, tag='calendar-notification'){
   if (!('Notification' in window)) return;
 
+  const options={
+    body: body,
+    tag: tag,
+    renotify: false,
+    requireInteraction: false
+  };
+
   if (Notification.permission === 'granted') {
-    new Notification(title, {
-      body: body,
-      tag: title + body,
-      requireInteraction: false
-    });
+    new Notification(title, options);
   } else if (Notification.permission === 'default') {
     Notification.requestPermission().then(permission => {
-      if (permission === 'granted') {
-        new Notification(title, {
-          body: body,
-          tag: title + body,
-          requireInteraction: false
-        });
-      }
+      if (permission === 'granted') new Notification(title, options);
     });
   }
 }
@@ -1089,19 +1161,8 @@ document.getElementById('sn-ok').addEventListener('click',()=>{
 });
 
 function buildDayEvents(key){
-  const evs=S.events[key]||[];
-  const result=[];
-  evs.forEach(ev=>result.push(ev));
-  // Add recurring
-  Object.entries(S.events).forEach(([k,evlist])=>{
-    const{m,d}=parseKey(k);
-    const{m:km,d:kd}=parseKey(key);
-    evlist.forEach(ev=>{
-      if(ev.recurring&&ev.type==='charge'&&d===kd&&m!==km)
-        result.push(ev);
-    });
-  });
-  return result;
+  // Возвращаем только реальные события этого дня. Ежемесячные списания теперь заранее создаются отдельными событиями на будущие месяцы.
+  return [...(S.events[key]||[])];
 }
 
 function notifLabel(key){
@@ -1127,6 +1188,7 @@ function checkScheduledNotifs(){
         const twoHours=2*60*60*1000;
         if(Date.now()-lastSent>twoHours){
           save(storKey,Date.now());
+          if(shouldSuppressStartupNotif()) return;
           queueNotif('Списание',`${label}, ${d} ${MONTHS_GEN[m]}: ${fmtCurrency(ev.amount,ev.currency)} — ${ev.text}`);
         }
       } else if(ev.type==='event'||(ev.type==='important'&&ev.noTime)){
@@ -1135,6 +1197,7 @@ function checkScheduledNotifs(){
         const twoHours=2*60*60*1000;
         if(Date.now()-lastSent>twoHours){
           save(storKey,Date.now());
+          if(shouldSuppressStartupNotif()) return;
           const prefix=ev.type==='important'?'❗ ':'';
           queueNotif(ev.type==='important'?'Важное событие':'Событие',`${label}, ${d} ${MONTHS_GEN[m]}: ${prefix}${ev.text}`);
         }
@@ -1150,6 +1213,7 @@ function checkScheduledNotifs(){
             const storKey=`notif_imp_${key}_${ev.text}_${deltaMin}`;
             if(!load(storKey,false)){
               save(storKey,true);
+              if(shouldSuppressStartupNotif()) return;
               queueNotif('Важное событие',`Через ${deltaMin<60?deltaMin+' мин.':deltaMin/60+' ч.'} — ❗ ${ev.time} ${ev.text}`);
             }
           }
@@ -1187,14 +1251,23 @@ document.getElementById('btn-notif-check').addEventListener('click',()=>{
 });
 
 function checkTodoSystemNotifications(){
+  const intervalMs=15*60*1000;
   const activeTodos = S.todos.filter(td => !td.done);
+  let idsAdded=false;
 
   activeTodos.forEach(td => {
+    if(!td.id){td.id='t'+Date.now()+Math.random().toString(36).slice(2,6);idsAdded=true;}
+    const key='todo_sys_last_'+td.id;
+    const lastSent=load(key,0);
+    if(Date.now()-lastSent<intervalMs) return;
+    save(key,Date.now());
     showSystemNotification(
       'Задача',
-      `${td.text} — выполнена ли задача?`
+      `${td.text} — выполнена ли задача?`,
+      'todo-'+td.id
     );
   });
+  if(idsAdded) save('cal_todos2',S.todos);
 }
 // ==================== TODO REMINDERS ====================
 let todoNotifQueue2=[];let todoNotifIdx2=0;
@@ -1233,12 +1306,8 @@ startCloudSync();
 
 if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();
 
-setTimeout(()=>{
-  checkTodoReminders();
-  checkScheduledNotifs();
-  checkTodoSystemNotifications();
-}, 1200);
-
+// Не запускаем уведомления сразу при загрузке: иначе после включения компьютера они могут вывалиться пачкой.
+// Первые проверки начнутся через свой обычный интервал.
 setInterval(checkScheduledNotifs, 5 * 60 * 1000);
 setInterval(checkTodoSystemNotifications, 15 * 60 * 1000);
 </script>
